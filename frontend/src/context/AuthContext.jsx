@@ -1,0 +1,398 @@
+/**
+ * AuthContext
+ *
+ * Provides authentication state and actions to the entire application.
+ * Wraps the app with AuthProvider to make user, profile, and auth
+ * functions available anywhere via the useAuth hook.
+ *
+ * State:
+ *   - user          : Supabase auth user object (or null)
+ *   - profile       : Row from the profiles table (includes role)
+ *   - loading       : true while session is being restored on first load
+ *   - authError     : Last auth error message (or null)
+ *
+ * Actions:
+ *   - login(email, password)
+ *   - register(fullName, email, password)
+ *   - logout()
+ *   - forgotPassword(email)   ← sends Supabase password-reset email
+ *   - resetPassword(newPwd)   ← updates password after reset link is clicked
+ *   - refreshProfile()        ← re-fetches profile from DB
+ *   - updateProfile(data)     ← updates profile in DB + refreshes state
+ *
+ * Computed:
+ *   - isAuthenticated : boolean
+ *   - isAdmin         : boolean
+ *   - isUser          : boolean
+ */
+
+import { createContext, useContext, useEffect, useState, useCallback } from 'react';
+
+import supabase         from '../services/supabase.js';
+import githubService   from '../services/githubService.js';
+
+// ─── Create Context ────────────────────────────────────────────────────────────
+export const AuthContext = createContext(null);
+
+// ─── AuthProvider ──────────────────────────────────────────────────────────────
+export const AuthProvider = ({ children }) => {
+  const [user, setUser] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [authError, setAuthError] = useState(null);
+
+  // ─── GitHub Connection State ─────────────────────────────────────────────
+  const [githubConnected, setGithubConnected] = useState(false);
+  const [githubUsername,  setGithubUsername]  = useState(null);
+  const [githubAvatar,    setGithubAvatar]    = useState(null);
+
+  // ─── Fetch Profile Row ────────────────────────────────────────────────────
+  /**
+   * Fetch the profiles row for a given user ID.
+   * Includes all columns — role, github_username, github_connected, etc.
+   */
+  const fetchProfile = useCallback(async (userId) => {
+    try {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', userId)
+        .single();
+
+      if (error) {
+        console.error('[AuthContext] Profile fetch error:', error.message);
+        return null;
+      }
+      return data;
+    } catch (err) {
+      console.error('[AuthContext] Unexpected profile error:', err.message);
+      return null;
+    }
+  }, []);
+
+  // ─── Restore Session on Mount ─────────────────────────────────────────────
+  useEffect(() => {
+    let mounted = true;
+
+    const initSession = async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+
+        if (mounted && session?.user) {
+          setUser(session.user);
+
+          // Fetch profile and GitHub status in parallel — both must complete
+          // before we drop the loading screen. This prevents the UI from
+          // briefly flashing "Not connected" when the user IS connected.
+          const [profileData, ghStatus] = await Promise.all([
+            fetchProfile(session.user.id),
+            githubService.status().catch(() => null), // non-fatal
+          ]);
+
+          if (mounted) {
+            setProfile(profileData);
+            if (ghStatus) {
+              setGithubConnected(ghStatus.connected);
+              setGithubUsername(ghStatus.username);
+              setGithubAvatar(ghStatus.avatar);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[AuthContext] Session restore error:', err.message);
+      } finally {
+        // Drop loading screen only after ALL state (including GitHub status)
+        // has been populated. This is the single source of truth for loading.
+        if (mounted) setLoading(false);
+      }
+    };
+
+    initSession();
+
+    // ─── Listen for Auth State Changes ────────────────────────────────────
+    // This listener handles events that happen AFTER the initial session
+    // restore: SIGNED_IN (new login), SIGNED_OUT, TOKEN_REFRESHED, etc.
+    // INITIAL_SESSION is intentionally NOT handled here — initSession()
+    // above already fetches user, profile, and GitHub status for that case,
+    // and calling setLoading(false) from inside an async Supabase callback
+    // (which Supabase does not await) is unreliable.
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      async (event, session) => {
+        if (!mounted) return;
+
+        // Skip INITIAL_SESSION — already handled by initSession() above.
+        // Processing it here would create a duplicate network request race.
+        if (event === 'INITIAL_SESSION') return;
+
+        if (session?.user) {
+          setUser(session.user);
+          const profileData = await fetchProfile(session.user.id);
+          if (mounted) setProfile(profileData);
+
+          // On a fresh SIGNED_IN event, fetch GitHub status so the UI
+          // reflects the correct connected state without a page refresh.
+          if (event === 'SIGNED_IN') {
+            try {
+              const ghStatus = await githubService.status();
+              if (mounted) {
+                setGithubConnected(ghStatus.connected);
+                setGithubUsername(ghStatus.username);
+                setGithubAvatar(ghStatus.avatar);
+              }
+            } catch {
+              // Non-fatal — user simply hasn't connected GitHub yet
+            }
+          }
+        } else {
+          setUser(null);
+          setProfile(null);
+          setGithubConnected(false);
+          setGithubUsername(null);
+          setGithubAvatar(null);
+        }
+      }
+    );
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, [fetchProfile]);
+
+
+  // ─── Login ────────────────────────────────────────────────────────────────
+  const login = async (email, password) => {
+    setAuthError(null);
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: email.trim(),
+        password,
+      });
+
+      if (error) {
+        const message = error.message || 'Login failed. Please try again.';
+        setAuthError(message);
+        return { success: false, error: message };
+      }
+
+      return { success: true, user: data.user };
+    } catch (err) {
+      const message = 'An unexpected error occurred. Please try again.';
+      setAuthError(message);
+      return { success: false, error: message };
+    }
+  };
+
+  // ─── Register ─────────────────────────────────────────────────────────────
+  const register = async (fullName, email, password) => {
+    setAuthError(null);
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email: email.trim(),
+        password,
+        options: {
+          data: {
+            full_name: fullName.trim(),
+          },
+        },
+      });
+
+      if (error) {
+        const message = error.message || 'Registration failed. Please try again.';
+        setAuthError(message);
+        return { success: false, error: message };
+      }
+
+      if (data.session) {
+        return { success: true, user: data.user, requiresConfirmation: false };
+      } else {
+        return { success: true, user: data.user, requiresConfirmation: true };
+      }
+    } catch (err) {
+      const message = 'An unexpected error occurred. Please try again.';
+      setAuthError(message);
+      return { success: false, error: message };
+    }
+  };
+
+  // ─── Logout ───────────────────────────────────────────────────────────────
+  const logout = async () => {
+    try {
+      const { error } = await supabase.auth.signOut();
+      if (error) {
+        console.error('[AuthContext] Logout error:', error.message);
+      }
+      // State cleared by onAuthStateChange listener → redirect handled by ProtectedRoute
+    } catch (err) {
+      console.error('[AuthContext] Logout error:', err.message);
+    }
+  };
+
+  // ─── Forgot Password ──────────────────────────────────────────────────────
+  /**
+   * Sends a password-reset email via Supabase.
+   * The reset link in the email will point to /reset-password.
+   *
+   * @param {string} email
+   * @returns {Promise<{ success: boolean, error?: string }>}
+   */
+  const forgotPassword = async (email) => {
+    setAuthError(null);
+    try {
+      const redirectTo = `${window.location.origin}/reset-password`;
+      const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        redirectTo,
+      });
+      if (error) {
+        const message = error.message || 'Failed to send reset email. Please try again.';
+        setAuthError(message);
+        return { success: false, error: message };
+      }
+      return { success: true };
+    } catch (err) {
+      const message = 'An unexpected error occurred. Please try again.';
+      setAuthError(message);
+      return { success: false, error: message };
+    }
+  };
+
+  // ─── Reset Password ───────────────────────────────────────────────────────
+  /**
+   * Updates the current user's password.
+   * Must be called after the user has clicked the reset link (has a valid session).
+   *
+   * @param {string} newPassword
+   * @returns {Promise<{ success: boolean, error?: string }>}
+   */
+  const resetPassword = async (newPassword) => {
+    setAuthError(null);
+    try {
+      const { error } = await supabase.auth.updateUser({ password: newPassword });
+      if (error) {
+        const message = error.message || 'Failed to update password. Please try again.';
+        setAuthError(message);
+        return { success: false, error: message };
+      }
+      return { success: true };
+    } catch (err) {
+      const message = 'An unexpected error occurred. Please try again.';
+      setAuthError(message);
+      return { success: false, error: message };
+    }
+  };
+
+  // ─── refreshProfile ───────────────────────────────────────────────────────
+  /**
+   * Manually re-fetch the profile from Supabase and update state.
+   * Call this after any operation that modifies the profiles table
+   * (e.g., GitHub connection, avatar upload, role change).
+   *
+   * @returns {Promise<object|null>} The refreshed profile, or null on error
+   */
+  const refreshProfile = useCallback(async () => {
+    if (!user?.id) return null;
+    const profileData = await fetchProfile(user.id);
+    setProfile(profileData);
+    return profileData;
+  }, [user, fetchProfile]);
+
+  // ─── refreshGitHubStatus ──────────────────────────────────────────────────
+  /**
+   * Re-fetch the GitHub connection status from the backend and update state.
+   * Call this after a successful GitHub connect or disconnect.
+   *
+   * @returns {Promise<{ connected: boolean, username: string|null, avatar: string|null }|null>}
+   */
+  const refreshGitHubStatus = useCallback(async () => {
+    if (!user?.id) return null;
+    try {
+      const status = await githubService.status();
+      setGithubConnected(status.connected);
+      setGithubUsername(status.username);
+      setGithubAvatar(status.avatar);
+      return status;
+    } catch (err) {
+      console.error('[AuthContext] refreshGitHubStatus error:', err.message);
+      return null;
+    }
+  }, [user]);
+
+  // ─── updateProfile ────────────────────────────────────────────────────────
+  /**
+   * Update allowed profile fields (full_name, avatar_url, github_username)
+   * directly via Supabase and refresh the local state.
+   *
+   * Does NOT allow role changes — those are backend/SQL only.
+   *
+   * @param {object} updates - { full_name?, avatar_url?, github_username? }
+   * @returns {Promise<{ success: boolean, error?: string }>}
+   */
+  const updateProfile = useCallback(async (updates) => {
+    if (!user?.id) return { success: false, error: 'Not authenticated' };
+
+    // Whitelist safe fields only — never allow role
+    const safeUpdates = {};
+    if (updates.full_name !== undefined) safeUpdates.full_name = updates.full_name;
+    if (updates.avatar_url !== undefined) safeUpdates.avatar_url = updates.avatar_url;
+    if (updates.github_username !== undefined) safeUpdates.github_username = updates.github_username;
+
+    if (Object.keys(safeUpdates).length === 0) {
+      return { success: false, error: 'No valid fields to update' };
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from('profiles')
+        .update(safeUpdates)
+        .eq('id', user.id)
+        .select('*')
+        .single();
+
+      if (error) {
+        return { success: false, error: error.message };
+      }
+
+      setProfile(data);
+      return { success: true, profile: data };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }, [user]);
+
+  // ─── Context Value ────────────────────────────────────────────────────────
+  const value = {
+    // State
+    user,
+    profile,
+    loading,
+    authError,
+
+    // Computed
+    isAuthenticated: !!user,
+    isAdmin: profile?.role === 'admin',
+    isUser:  profile?.role === 'user',
+
+    // GitHub State
+    githubConnected,
+    githubUsername,
+    githubAvatar,
+
+    // Auth Actions
+    login,
+    register,
+    logout,
+    forgotPassword,
+    resetPassword,
+
+    // Profile Actions
+    refreshProfile,
+    updateProfile,
+
+    // GitHub Actions
+    refreshGitHubStatus,
+  };
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+};
+
+export default AuthProvider;
