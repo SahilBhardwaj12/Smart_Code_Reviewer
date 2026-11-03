@@ -50,6 +50,8 @@ dependencies = [
 
     # AWS SDK (SES email sending)
     "boto3>=1.35.0",
+    #greenlet
+    "greenlet>=3.0",
 ]
 
 [project.optional-dependencies]
