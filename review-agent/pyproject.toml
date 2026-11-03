@@ -52,8 +52,8 @@ dependencies = [
     "boto3>=1.35.0",
     #greenlet
     "greenlet>=3.0",
-    #psycopg
-    "psycopg[binary]>=3.1",
+    #asyncpg
+     "asyncpg>=0.29",
 ]
 
 [project.optional-dependencies]
