@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     # ── Impact slicing ────────────────────────────────────────────────────────
     impact_slice_max_tokens: int = 20_000
 
+        # ── LLM orchestration mode ────────────────────────────────────────────────
+    llm_orchestration: str = "simple"
+
     # ── Email Settings ────────────────────────────────────────────────────────
     email_enabled: bool = False
     # SES is tried first if configured; falls back to Brevo automatically.
